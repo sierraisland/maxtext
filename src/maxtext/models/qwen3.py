@@ -37,6 +37,7 @@ from maxtext.common.common_types import (
     Config,
     DType,
     EMBED,
+    HEAD,
     KV_BATCH,
     KV_HEAD,
     LENGTH,
@@ -790,10 +791,11 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
       )
       return jax.sharding.NamedSharding(self.mesh, pspec)
 
+    gdn_head_axis = HEAD if self.config.attention in ("vllm_rpa", "vllm_batched_rpa") else KV_HEAD
     return (
-        _sharding((KV_BATCH, cp_len, KV_HEAD)),
-        _sharding((KV_BATCH, cp_len, KV_HEAD, None)),
-        _sharding((KV_BATCH, KV_HEAD, None, None)),
+        _sharding((KV_BATCH, cp_len, gdn_head_axis)),
+        _sharding((KV_BATCH, cp_len, gdn_head_axis, None)),
+        _sharding((KV_BATCH, gdn_head_axis, None, None)),
     )
 
   @staticmethod
@@ -866,6 +868,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
     batch, seq_len, _ = hidden_states.shape
     use_gdn_kernel = getattr(cfg, "use_gdn_kernel", False)
     flat_sharding, head_sharding, state_sharding = self._explicit_activation_shardings(batch)
+    gdn_head_axis = HEAD if cfg.attention in ("vllm_rpa", "vllm_batched_rpa") else KV_HEAD
 
     active_cache = kv_cache if kv_cache is not None else self.cache
 
@@ -927,7 +930,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         # and the reason the first version of this patch cut GDN memory but still
         # lost overall.
         cp_len = LENGTH if gdn_context_axes(cfg) else None
-      qkvz_pspec = logical_to_mesh_axes((KV_BATCH, cp_len, KV_HEAD, None), mesh=self.mesh, rules=logical_rules)
+      qkvz_pspec = logical_to_mesh_axes((KV_BATCH, cp_len, gdn_head_axis, None), mesh=self.mesh, rules=logical_rules)
       if cp_axes_active and qkvz_pspec[1] is None:
         qkvz_pspec = jax.sharding.PartitionSpec(qkvz_pspec[0], cp_axis_for_pspec, *qkvz_pspec[2:])
       # Training microbatches can be smaller than the physical KV_BATCH mesh partition.
@@ -1321,9 +1324,9 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         # logical rules, so this is correct whichever one is configured.
         cp_axes = gdn_context_axes(cfg)
         cp_len = LENGTH if cp_axes else None
-        qkv_pspec = logical_to_mesh_axes((KV_BATCH, cp_len, KV_HEAD, None), mesh=self.mesh, rules=logical_rules)
-        g_beta_pspec = logical_to_mesh_axes((KV_BATCH, cp_len, KV_HEAD), mesh=self.mesh, rules=logical_rules)
-        state_pspec = logical_to_mesh_axes((KV_BATCH, KV_HEAD, None, None), mesh=self.mesh, rules=logical_rules)
+        qkv_pspec = logical_to_mesh_axes((KV_BATCH, cp_len, gdn_head_axis, None), mesh=self.mesh, rules=logical_rules)
+        g_beta_pspec = logical_to_mesh_axes((KV_BATCH, cp_len, gdn_head_axis), mesh=self.mesh, rules=logical_rules)
+        state_pspec = logical_to_mesh_axes((KV_BATCH, gdn_head_axis, None, None), mesh=self.mesh, rules=logical_rules)
         # Keep every shard_map input/output batch spec consistent when replication is required.
         qkv_pspec = remove_incompatible_mesh_axes_from_partition_spec(
             qkv_pspec,
