@@ -491,6 +491,13 @@ class MaxTextForCausalLM(nnx.Module):
         num_requant = linears.requantize_model_dense_fp8_to_per_channel(model)
         if num_requant > 0:
           max_logging.log(f"Requantized {num_requant} block-wise FP8 DenseGeneral layers to per-channel.")
+      if (
+          getattr(self.maxtext_config, "prefuse_moe_weights", False)
+          or os.environ.get("FUSE_SHARED_EXPERT_WI", "0") == "1"
+      ) and os.environ.get("ENABLE_FULL_FP8_OPTIMIZATIONS", "1") == "1":
+        num_fused = linears.fuse_model_mlp_wi(model)
+        if num_fused > 0:
+          max_logging.log(f"Fused {num_fused} MlpBlock wi_0/wi_1 projections into 3D wi.")
       if self.maxtext_config.lora.enable_lora:
         model = lora_utils.apply_lora_to_model(model, self.mesh, self.maxtext_config)
         if self.maxtext_config.lora.lora_restore_path:
