@@ -369,7 +369,7 @@ class DenseGeneral(nnx.Module):
         resolved_scale_shape = tuple(d if d < b else d // b for d, b in zip(kernel_shape, block_sizes))
       elif (
           isinstance(self.quant, quantizations.ServeFp8WeightQuantization)
-          and os.environ.get("MAXTEXT_FP8_DENSE_PER_CHANNEL", "0") == "1"
+          and os.environ.get("MAXTEXT_FP8_DENSE_PER_CHANNEL", "1") == "1"
       ):
         resolved_scale_shape = (1,) * len(self.in_features_shape) + self.out_features_shape
       else:

@@ -37,8 +37,10 @@ from maxtext.integration.vllm.convert_utils import (
     _jit_unstack,
     _scanned_sharding_from_per_layer,
     _sharding_summary,
+    is_fp8_dtype,
     normalize_dtype,
     pad_to_tpu_lanes,
+    quantize_fp8_weight_and_scale,
     resolve_rollout_tp,
 )
 
@@ -484,6 +486,45 @@ _NON_WEIGHT_PATH_PREFIXES = ("cache", "rngs", "intermediates")
 
 _SUPPORTED_TARGET_FREE_DTYPES = frozenset({jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16), jnp.dtype(jnp.float32)})
 
+# Maps rollout FP8 scale leaf names to their companion weight leaf names.
+_SCALE_TO_WEIGHT_LEAF: Dict[str, str] = {
+    "kernel_scale": "kernel",
+    "wi_scale": "wi",
+    "wi_0_scale": "wi_0",
+    "wi_1_scale": "wi_1",
+    "wo_scale": "wo",
+}
+
+_DEFAULT_FP8_FULL_UNQUANTIZED_MODULES: Tuple[str, ...] = (
+    "token_embedder",
+    "logits_dense",
+    "gate",
+    "shared_expert_gate",
+    "conv1d",
+    "in_proj_ba",
+    "A_log",
+    "dt_bias",
+    "norm",
+)
+
+
+def _is_target_free_unquantized_dense(key_tuple: Tuple[Any, ...], config: Any) -> bool:
+  """Whether a target-free `.kernel` leaf belongs to an unquantized module under `rollout_fp8_full`."""
+  unquantized = getattr(config, "unquantized_modules", None) or _DEFAULT_FP8_FULL_UNQUANTIZED_MODULES
+  if isinstance(unquantized, str):
+    unquantized = (unquantized,)
+  path_parts = tuple(str(p) for p in key_tuple[:-1])
+  return any(part in unquantized for part in path_parts)
+
+
+def _target_free_scale_shape(w_shape: Tuple[int, ...], tgt_key: Tuple[Any, ...]) -> Tuple[int, ...]:
+  """Resolves per-channel scale shape for target-free FP8 quantization."""
+  if tgt_key and tgt_key[-1] in MOE_MLP_WEIGHTS:
+    return (w_shape[0], 1, w_shape[2])
+  if len(w_shape) == 3 and len(tgt_key) >= 2 and tgt_key[-2] in ("query", "key", "value", "qkv_proj", "wi"):
+    return (1, w_shape[1], w_shape[2])
+  return (1,) * (len(w_shape) - 1) + (w_shape[-1],)
+
 
 def _cast_target_free_floating_leaf(val: Any, target_dtype: Any, path: str) -> Any:
   """Casts floating-point leaves to `target_dtype`, leaving non-floating leaves untouched."""
@@ -522,6 +563,8 @@ class _PlanEntry:
   slice_index: Optional[int]
   op: str  # "identity" | "slice" | "fuse_moe"
   local_index: Optional[int] = None
+  # Optional companion FP8 scale target leaf dynamically computed alongside `target_key`.
+  scale_target_key: Optional[Tuple[Any, ...]] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -547,6 +590,13 @@ class _PlanGroup:
   # leaf-name check inside `_align_per_axis`.
   source_path: str
   local_index: Optional[int] = None
+  # Parallel (slice_index, scale_target_key) pairs when dynamic FP8 quantization is active.
+  scale_targets: Tuple[Tuple[Optional[int], Optional[Tuple[Any, ...]]], ...] = ()
+
+  @property
+  def quantize_to_fp8(self) -> bool:
+    """Whether this group dynamically quantizes weights to FP8 and emits companion scales."""
+    return bool(self.scale_targets and self.scale_targets[0][1] is not None)
 
 
 def _group_plan(plan: List[_PlanEntry]) -> List[_PlanGroup]:
@@ -571,6 +621,10 @@ def _group_plan(plan: List[_PlanEntry]) -> List[_PlanGroup]:
   for key in order:
     entries = grouped[key]
     source_keys, op, local_index = key
+    sorted_entries = sorted(
+        entries,
+        key=lambda e: -1 if e.slice_index is None else e.slice_index,
+    )
     groups.append(
         _PlanGroup(
             source_keys=source_keys,
@@ -581,12 +635,10 @@ def _group_plan(plan: List[_PlanEntry]) -> List[_PlanGroup]:
                 # `identity` entries carry no index; -1 keeps the sort key
                 # totally ordered so None is never compared against an int
                 # (or against another None).
-                for e in sorted(
-                    entries,
-                    key=lambda e: -1 if e.slice_index is None else e.slice_index,
-                )
+                for e in sorted_entries
             ),
             source_path=".".join(map(str, source_keys[0])),
+            scale_targets=tuple((e.slice_index, e.scale_target_key) for e in sorted_entries),
         )
     )
   return groups
@@ -719,6 +771,8 @@ class MaxTextToMaxTextConverter:
       target_dtype: Optional[Any] = None,
       kv_tp_size: Optional[int] = None,
       moe_mlp_tp_size: Optional[int] = None,
+      fp8_moe: Optional[bool] = None,
+      fp8_full: Optional[bool] = None,
   ):
     self.config = config
     self.tp = resolve_rollout_tp(config, tp)
@@ -733,6 +787,15 @@ class MaxTextToMaxTextConverter:
       self.prefuse_moe_weights = prefuse_moe_weights
     else:
       self.prefuse_moe_weights = getattr(config, "prefuse_moe_weights", False)
+    self.fp8_full = bool(fp8_full if fp8_full is not None else getattr(config, "rollout_fp8_full", False))
+    self.fp8_moe = bool(
+        fp8_moe
+        if fp8_moe is not None
+        else (getattr(config, "fp8_moe", False) or getattr(config, "rollout_fp8_moe", False) or self.fp8_full)
+    )
+    self.fused_mlp = bool(
+        getattr(config, "fused_mlp", False) or getattr(config, "rollout_fused_mlp", False) or self.fp8_full
+    )
     self.padded_base_moe_mlp_dim = getattr(config, "padded_base_moe_mlp_dim", None)
     cfg_rollout_dtype = getattr(config, "rollout_weight_dtype", None) or None
     if target_dtype is not None:
@@ -824,7 +887,15 @@ class MaxTextToMaxTextConverter:
         continue
 
       if "layers" not in src_key:
-        plan.append(_PlanEntry(src_key, (src_key,), None, "identity"))
+        scale_tgt_key = None
+        if (
+            self.fp8_full
+            and src_key
+            and src_key[-1] == "kernel"
+            and not _is_target_free_unquantized_dense(src_key, self.config)
+        ):
+          scale_tgt_key = src_key[:-1] + ("kernel_scale",)
+        plan.append(_PlanEntry(src_key, (src_key,), None, "identity", None, scale_tgt_key))
         continue
 
       idx = src_key.index("layers")
@@ -861,7 +932,7 @@ class MaxTextToMaxTextConverter:
 
       is_mlp_wi_0 = bool(len(suffix) >= 2 and suffix[-2] == "wi_0")
       mlp_wi_1_key = src_key[:-2] + ("wi_1", suffix[-1]) if is_mlp_wi_0 else None
-      fuse_mlp = bool(getattr(self.config, "fused_mlp", False)) and is_mlp_wi_0 and (mlp_wi_1_key in src_flat)
+      fuse_mlp = self.fused_mlp and is_mlp_wi_0 and (mlp_wi_1_key in src_flat)
 
       if fuse_moe:
         consumed_wi_1.add(wi_1_key)
@@ -869,7 +940,10 @@ class MaxTextToMaxTextConverter:
           for b in range(self.num_blocks):
             global_idx = b * self.cycle + slot
             tgt_key = prefix + (f"layers_{global_idx}",) + suffix[:-1] + ("wi",)
-            plan.append(_PlanEntry(tgt_key, (src_key, wi_1_key), b, "fuse_moe", local_index))
+            scale_tgt_key = (
+                prefix + (f"layers_{global_idx}",) + suffix[:-1] + ("wi_scale",) if self.fp8_moe else None
+            )
+            plan.append(_PlanEntry(tgt_key, (src_key, wi_1_key), b, "fuse_moe", local_index, scale_tgt_key))
       elif self.prefuse_moe_weights and suffix and suffix[-1] == "wi_1" and (src_key[:-1] + ("wi_0",) in src_flat):
         continue
       elif fuse_mlp:
@@ -878,9 +952,18 @@ class MaxTextToMaxTextConverter:
           for b in range(self.num_blocks):
             global_idx = b * self.cycle + slot
             tgt_key = prefix + (f"layers_{global_idx}",) + suffix[:-2] + ("wi", suffix[-1])
-            plan.append(_PlanEntry(tgt_key, (src_key, mlp_wi_1_key), b, "fuse_mlp", local_index))
+            scale_tgt_key = (
+                tgt_key[:-1] + ("kernel_scale",)
+                if (
+                    self.fp8_full
+                    and suffix[-1] == "kernel"
+                    and not _is_target_free_unquantized_dense(tgt_key, self.config)
+                )
+                else None
+            )
+            plan.append(_PlanEntry(tgt_key, (src_key, mlp_wi_1_key), b, "fuse_mlp", local_index, scale_tgt_key))
       elif (
-          bool(getattr(self.config, "fused_mlp", False))
+          self.fused_mlp
           and len(suffix) >= 2
           and suffix[-2] == "wi_1"
           and (src_key[:-2] + ("wi_0", suffix[-1]) in src_flat)
@@ -891,7 +974,17 @@ class MaxTextToMaxTextConverter:
           for b in range(self.num_blocks):
             global_idx = b * self.cycle + slot
             tgt_key = prefix + (f"layers_{global_idx}",) + suffix
-            plan.append(_PlanEntry(tgt_key, (src_key,), b, "slice", local_index))
+            scale_tgt_key = None
+            if self.fp8_moe and suffix and suffix[-1] in MOE_MLP_WEIGHTS:
+              scale_tgt_key = tgt_key[:-1] + (f"{suffix[-1]}_scale",)
+            elif (
+                self.fp8_full
+                and suffix
+                and suffix[-1] == "kernel"
+                and not _is_target_free_unquantized_dense(tgt_key, self.config)
+            ):
+              scale_tgt_key = tgt_key[:-1] + ("kernel_scale",)
+            plan.append(_PlanEntry(tgt_key, (src_key,), b, "slice", local_index, scale_tgt_key))
 
     return plan
 
@@ -906,14 +999,52 @@ class MaxTextToMaxTextConverter:
     unmatched: List[Tuple[Any, ...]] = []
     consumed: set = set()
 
+    # Pre-detect rollout FP8 companion scale leaves (`kernel_scale`, `wi_scale`,
+    # `wi_0_scale`, `wi_1_scale`, `wo_scale`) that have no counterpart in an
+    # unquantized (BF16/FP32) trainer state so they are dynamically quantized
+    # alongside their companion FP8 weight leaf.
+    dynamic_scale_for_weight: Dict[Tuple[Any, ...], Tuple[Any, ...]] = {}
+    dynamically_quantized_scales: set = set()
+
+    def _scale_has_source(scale_tgt_key: Tuple[Any, ...]) -> bool:
+      if scale_tgt_key in src_flat:
+        return True
+      l_idx, p_len, s_start = _find_unrolled_layer(scale_tgt_key)
+      if l_idx < 0 or l_idx >= self.num_decoder_layers:
+        return False
+      cands = self._scanned_candidates(scale_tgt_key, p_len, s_start, l_idx % self.cycle)
+      if any(c in src_flat for c, _ in cands):
+        return True
+      if scale_tgt_key[-1] == "wi_scale":
+        return any((c[:-1] + ("wi_0_scale",) in src_flat and c[:-1] + ("wi_1_scale",) in src_flat) for c, _ in cands)
+      if len(scale_tgt_key) >= 2 and scale_tgt_key[-2:] == ("wi", "kernel_scale"):
+        return any(
+            (c[:-2] + ("wi_0", "kernel_scale") in src_flat and c[:-2] + ("wi_1", "kernel_scale") in src_flat)
+            for c, _ in cands
+        )
+      return False
+
     for tgt_key in tgt_flat:
       if tgt_key in skip_paths or _is_non_weight_path(tgt_key):
         continue
+      if tgt_key and tgt_key[-1] in _SCALE_TO_WEIGHT_LEAF and not _scale_has_source(tgt_key):
+        weight_leaf = _SCALE_TO_WEIGHT_LEAF[tgt_key[-1]]
+        weight_tgt_key = tgt_key[:-1] + (weight_leaf,)
+        weight_tgt_val = tgt_flat.get(weight_tgt_key)
+        if weight_tgt_val is not None and is_fp8_dtype(getattr(weight_tgt_val, "dtype", None)):
+          dynamic_scale_for_weight[weight_tgt_key] = tgt_key
+          dynamically_quantized_scales.add(tgt_key)
+
+    for tgt_key in tgt_flat:
+      if tgt_key in skip_paths or _is_non_weight_path(tgt_key) or tgt_key in dynamically_quantized_scales:
+        continue
+
+      scale_tgt_key = dynamic_scale_for_weight.get(tgt_key)
 
       # 1. Identical path on both sides (embeddings, final norm, lm head,
       #    and any layer already stored unscanned).
       if tgt_key in src_flat:
-        plan.append(_PlanEntry(tgt_key, (tgt_key,), None, "identity"))
+        plan.append(_PlanEntry(tgt_key, (tgt_key,), None, "identity", None, scale_tgt_key))
         consumed.add(tgt_key)
         continue
 
@@ -923,7 +1054,7 @@ class MaxTextToMaxTextConverter:
           wi_0 = tgt_key[:-2] + ("wi_0", tgt_key[-1])
           wi_1 = tgt_key[:-2] + ("wi_1", tgt_key[-1])
           if wi_0 in src_flat and wi_1 in src_flat:
-            plan.append(_PlanEntry(tgt_key, (wi_0, wi_1), None, "fuse_mlp_identity"))
+            plan.append(_PlanEntry(tgt_key, (wi_0, wi_1), None, "fuse_mlp_identity", None, scale_tgt_key))
             consumed.update((wi_0, wi_1))
             continue
         unmatched.append(tgt_key)
@@ -941,16 +1072,18 @@ class MaxTextToMaxTextConverter:
       matched = next(((c, li) for c, li in candidates if c in src_flat), None)
       if matched is not None:
         matched_key, local_index = matched
-        plan.append(_PlanEntry(tgt_key, (matched_key,), block, "slice", local_index))
+        plan.append(_PlanEntry(tgt_key, (matched_key,), block, "slice", local_index, scale_tgt_key))
         consumed.add(matched_key)
         continue
 
-      # 3. Rollout pre-fuses MoE `wi`; trainer still has `wi_0`/`wi_1`.
-      if tgt_key and tgt_key[-1] == "wi":
+      # 3. Rollout pre-fuses MoE `wi` (and `wi_scale`); trainer still has `wi_0`/`wi_1`.
+      if tgt_key and tgt_key[-1] in ("wi", "wi_scale"):
+        src_0_name = "wi_0" if tgt_key[-1] == "wi" else "wi_0_scale"
+        src_1_name = "wi_1" if tgt_key[-1] == "wi" else "wi_1_scale"
         for cand, local_index in candidates:
-          wi_0, wi_1 = cand[:-1] + ("wi_0",), cand[:-1] + ("wi_1",)
+          wi_0, wi_1 = cand[:-1] + (src_0_name,), cand[:-1] + (src_1_name,)
           if wi_0 in src_flat and wi_1 in src_flat:
-            plan.append(_PlanEntry(tgt_key, (wi_0, wi_1), block, "fuse_moe", local_index))
+            plan.append(_PlanEntry(tgt_key, (wi_0, wi_1), block, "fuse_moe", local_index, scale_tgt_key))
             consumed.update((wi_0, wi_1))
             break
         else:
@@ -964,7 +1097,7 @@ class MaxTextToMaxTextConverter:
           wi_0 = cand[:-2] + ("wi_0", leaf_name)
           wi_1 = cand[:-2] + ("wi_1", leaf_name)
           if wi_0 in src_flat and wi_1 in src_flat:
-            plan.append(_PlanEntry(tgt_key, (wi_0, wi_1), block, "fuse_mlp", local_index))
+            plan.append(_PlanEntry(tgt_key, (wi_0, wi_1), block, "fuse_mlp", local_index, scale_tgt_key))
             consumed.update((wi_0, wi_1))
             break
         else:
@@ -1019,11 +1152,18 @@ class MaxTextToMaxTextConverter:
   def _fuse_moe_bulk(self, wi_0, wi_1, tgt_val, key_path: str):
     """Fuses the *scanned* gate/up kernels, returning one array per block."""
     tgt_shape = tgt_val.shape
+    if len(tgt_shape) <= 1:
+      # Per-expert `(num_experts,)` or scalar `()` MoE scale: combine via elementwise max.
+      return _jit_unstack(jnp.maximum(wi_0, wi_1), self.scan_axis)
+
     # MaxText stores MoE kernels as (experts, in_dim, intermediate); the
     # gate/up fusion always doubles the trailing intermediate axis.
     tgt_fused_axis = len(tgt_shape) - 1
     # Same logical axis, shifted by the scan dim the trainer inserted.
     scan_fused_axis = tgt_fused_axis if tgt_fused_axis < self.scan_axis else tgt_fused_axis + 1
+    if tgt_shape[tgt_fused_axis] == wi_0.shape[scan_fused_axis]:
+      # Non-doubled trailing axis (e.g. `(num_experts, in_blocks, 1)` scale): combine via max.
+      return _jit_unstack(jnp.maximum(wi_0, wi_1), self.scan_axis)
 
     if self.moe_fused_layout == MoEFusedLayout.PER_SHARD_INTERLEAVE:
       if isinstance(getattr(tgt_val, "sharding", None), jax.sharding.NamedSharding):
@@ -1141,14 +1281,31 @@ class MaxTextToMaxTextConverter:
 
     raise ConversionPlanError(f"Unknown moe_fused_layout: {self.moe_fused_layout!r}")
 
+  def _quantize_blocks_target_free(self, per_block: Any, group: _PlanGroup):
+    """Quantizes unstacked per-layer blocks to FP8 and emits companion scales."""
+    outs = []
+    for (idx, tgt_key), (_, scale_key) in zip(group.targets, group.scale_targets):
+      w = per_block[0 if idx is None else idx]
+      scale_shape = _target_free_scale_shape(w.shape, tgt_key)
+      if isinstance(w, jax.ShapeDtypeStruct):
+        q_weight = jax.ShapeDtypeStruct(w.shape, jnp.dtype(jnp.float8_e4m3fn))
+        scale = jax.ShapeDtypeStruct(scale_shape, jnp.dtype(jnp.float32))
+      else:
+        q_weight, scale = quantize_fp8_weight_and_scale(w, scale_shape, jnp.float8_e4m3fn, jnp.float32)
+      outs.append((tgt_key, q_weight))
+      if scale_key is not None:
+        outs.append((scale_key, scale))
+    return outs
+
   def _execute_group_target_free(self, group: _PlanGroup, src_flat):
     """Executes a conversion plan group without a target state."""
     path = group.source_path
     target_dtype = self._resolve_target_dtype()
+    quantize_fp8 = group.quantize_to_fp8
 
     if group.op == "identity":
       raw_val = src_flat[group.source_keys[0]]
-      val = _cast_target_free_floating_leaf(raw_val, target_dtype, path)
+      val = raw_val if quantize_fp8 else _cast_target_free_floating_leaf(raw_val, target_dtype, path)
       is_kv = "key.kernel" in path or "value.kernel" in path
       if (
           is_kv
@@ -1161,26 +1318,38 @@ class MaxTextToMaxTextConverter:
           val = jax.ShapeDtypeStruct(tuple(new_shape), val.dtype)
         else:
           val = _jit_repeat_axes(val, ((-2, self.kv_replication),))
+      if quantize_fp8:
+        return self._quantize_blocks_target_free((val,), group)
       return [(tgt_key, val) for _, tgt_key in group.targets]
 
     if group.op == "fuse_moe":
       raw_0 = src_flat[group.source_keys[0]]
       raw_1 = src_flat[group.source_keys[1]]
-      wi_0, wi_1 = (
-          _cast_target_free_floating_leaf(self._take_cycle_slot(raw_0, group), target_dtype, path),
-          _cast_target_free_floating_leaf(self._take_cycle_slot(raw_1, group), target_dtype, path),
-      )
+      if quantize_fp8:
+        wi_0 = self._take_cycle_slot(raw_0, group)
+        wi_1 = self._take_cycle_slot(raw_1, group)
+      else:
+        wi_0, wi_1 = (
+            _cast_target_free_floating_leaf(self._take_cycle_slot(raw_0, group), target_dtype, path),
+            _cast_target_free_floating_leaf(self._take_cycle_slot(raw_1, group), target_dtype, path),
+        )
       self._check_scan_axis(wi_0, path)
       per_block = self._fuse_moe_bulk_target_free(wi_0, wi_1, path)
+      if quantize_fp8:
+        return self._quantize_blocks_target_free(per_block, group)
       return [(tgt_key, per_block[idx]) for idx, tgt_key in group.targets]
 
     if group.op == "fuse_mlp":
       raw_0 = src_flat[group.source_keys[0]]
       raw_1 = src_flat[group.source_keys[1]]
-      wi_0, wi_1 = (
-          _cast_target_free_floating_leaf(self._take_cycle_slot(raw_0, group), target_dtype, path),
-          _cast_target_free_floating_leaf(self._take_cycle_slot(raw_1, group), target_dtype, path),
-      )
+      if quantize_fp8:
+        wi_0 = self._take_cycle_slot(raw_0, group)
+        wi_1 = self._take_cycle_slot(raw_1, group)
+      else:
+        wi_0, wi_1 = (
+            _cast_target_free_floating_leaf(self._take_cycle_slot(raw_0, group), target_dtype, path),
+            _cast_target_free_floating_leaf(self._take_cycle_slot(raw_1, group), target_dtype, path),
+        )
       self._check_scan_axis(wi_0, path)
       if isinstance(wi_0, jax.ShapeDtypeStruct):
         unrolled = list(wi_0.shape[: self.scan_axis] + wi_0.shape[self.scan_axis + 1 :])
@@ -1188,26 +1357,54 @@ class MaxTextToMaxTextConverter:
         per_block = tuple(jax.ShapeDtypeStruct(fused_shape, wi_0.dtype) for _ in range(wi_0.shape[self.scan_axis]))
       else:
         per_block = _fuse_and_unstack_mlp(wi_0, wi_1, self.scan_axis, stack_axis=-2)
+      if quantize_fp8:
+        return self._quantize_blocks_target_free(per_block, group)
       return [(tgt_key, per_block[idx]) for idx, tgt_key in group.targets]
 
     # group.op == "slice"
     raw_val = src_flat[group.source_keys[0]]
-    val = _cast_target_free_floating_leaf(self._take_cycle_slot(raw_val, group), target_dtype, path)
+    val = (
+        self._take_cycle_slot(raw_val, group)
+        if quantize_fp8
+        else _cast_target_free_floating_leaf(self._take_cycle_slot(raw_val, group), target_dtype, path)
+    )
     self._check_scan_axis(val, path)
     per_block = self._slice_bulk_target_free(val, path)
+    if quantize_fp8:
+      return self._quantize_blocks_target_free(per_block, group)
     return [(tgt_key, per_block[idx]) for idx, tgt_key in group.targets]
 
   def _execute_group(self, group: _PlanGroup, src_flat, tgt_flat):
     """Produces every target leaf in `group`. Returns (target_key, array) pairs."""
     first_tgt = tgt_flat[group.targets[0][1]]
     path = group.source_path
+    has_scale = bool(group.scale_targets and group.scale_targets[0][1] is not None)
+    first_scale_tgt = tgt_flat[group.scale_targets[0][1]] if has_scale else None
 
     if group.op == "identity":
-      val = _apply_dtype_cast(src_flat[group.source_keys[0]], first_tgt.dtype, path)
+      raw = src_flat[group.source_keys[0]]
+      if has_scale:
+        aligned = _align_per_axis(raw, first_tgt.shape, getattr(first_tgt, "sharding", None), path)
+        q_weight, scale = quantize_fp8_weight_and_scale(
+            aligned, first_scale_tgt.shape, first_tgt.dtype, first_scale_tgt.dtype
+        )
+        outs = [(tgt_key, q_weight) for _, tgt_key in group.targets]
+        outs.extend((scale_key, scale) for _, scale_key in group.scale_targets if scale_key is not None)
+        return outs
+      val = _apply_dtype_cast(raw, first_tgt.dtype, path)
       out = _align_per_axis(val, first_tgt.shape, getattr(first_tgt, "sharding", None), path)
       return [(tgt_key, out) for _, tgt_key in group.targets]
 
     if group.op == "fuse_mlp_identity":
+      if has_scale:
+        wi_0, wi_1 = (src_flat[k] for k in group.source_keys)
+        fused = jnp.stack([wi_0, wi_1], axis=-2)
+        q_weight, scale = quantize_fp8_weight_and_scale(
+            fused, first_scale_tgt.shape, first_tgt.dtype, first_scale_tgt.dtype
+        )
+        outs = [(tgt_key, q_weight) for _, tgt_key in group.targets]
+        outs.extend((scale_key, scale) for _, scale_key in group.scale_targets if scale_key is not None)
+        return outs
       wi_0, wi_1 = (_apply_dtype_cast(src_flat[k], first_tgt.dtype, path) for k in group.source_keys)
       if first_tgt.shape == ():
         out = jnp.maximum(wi_0, wi_1)
@@ -1216,24 +1413,41 @@ class MaxTextToMaxTextConverter:
       return [(tgt_key, out) for _, tgt_key in group.targets]
 
     if group.op == "fuse_moe":
-      wi_0, wi_1 = (
-          _apply_dtype_cast(self._take_cycle_slot(src_flat[k], group), first_tgt.dtype, path) for k in group.source_keys
-      )
+      if has_scale:
+        wi_0, wi_1 = (self._take_cycle_slot(src_flat[k], group) for k in group.source_keys)
+      else:
+        wi_0, wi_1 = (
+            _apply_dtype_cast(self._take_cycle_slot(src_flat[k], group), first_tgt.dtype, path) for k in group.source_keys
+        )
       self._check_scan_axis(wi_0, path)
       per_block = self._fuse_moe_bulk(wi_0, wi_1, first_tgt, path)
     elif group.op == "fuse_mlp":
-      wi_0, wi_1 = (
-          _apply_dtype_cast(self._take_cycle_slot(src_flat[k], group), first_tgt.dtype, path) for k in group.source_keys
-      )
+      if has_scale:
+        wi_0, wi_1 = (self._take_cycle_slot(src_flat[k], group) for k in group.source_keys)
+      else:
+        wi_0, wi_1 = (
+            _apply_dtype_cast(self._take_cycle_slot(src_flat[k], group), first_tgt.dtype, path) for k in group.source_keys
+        )
       self._check_scan_axis(wi_0, path)
       if first_tgt.shape == ():
         per_block = _jit_unstack(jnp.maximum(wi_0, wi_1), self.scan_axis)
       else:
         per_block = _fuse_and_unstack_mlp(wi_0, wi_1, self.scan_axis, stack_axis=-2)
     else:  # "slice"
-      val = _apply_dtype_cast(self._take_cycle_slot(src_flat[group.source_keys[0]], group), first_tgt.dtype, path)
+      raw = self._take_cycle_slot(src_flat[group.source_keys[0]], group)
+      val = raw if has_scale else _apply_dtype_cast(raw, first_tgt.dtype, path)
       self._check_scan_axis(val, path)
       per_block = _bulk_align_and_unstack(val, self.scan_axis, first_tgt, path)
+
+    if has_scale:
+      outs = []
+      for (idx, tgt_key), (_, scale_key) in zip(group.targets, group.scale_targets):
+        tgt_val = tgt_flat[tgt_key]
+        scale_val = tgt_flat[scale_key]
+        q_weight, scale = quantize_fp8_weight_and_scale(per_block[idx], scale_val.shape, tgt_val.dtype, scale_val.dtype)
+        outs.append((tgt_key, q_weight))
+        outs.append((scale_key, scale))
+      return outs
 
     return [(tgt_key, per_block[idx]) for idx, tgt_key in group.targets]
 

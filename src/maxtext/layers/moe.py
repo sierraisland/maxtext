@@ -943,6 +943,8 @@ class RoutedMoE(nnx.Module):
     elif ctypes.is_module_unquantized(config, "routed_experts"):
       weight_dtype = ctypes.get_weight_dtype(config, "routed_experts")
       quant = ctypes.get_quant(config, "routed_experts", quant)
+    elif getattr(config, "fp8_moe", False):
+      weight_dtype = jnp.float8_e4m3fn
 
     self.config = config
     self.force_dropless = force_dropless
@@ -1232,6 +1234,10 @@ class RoutedMoE(nnx.Module):
         else:
           wi_scale_shape = (num_experts, in_blocks, out_blocks)
           wo_scale_shape = (self.num_experts, out_blocks, in_blocks)
+      elif getattr(self.config, "fp8_moe", False):
+        fused_out_dim = moe_intermediate_dim * 2 if self.config.prefuse_moe_weights else moe_intermediate_dim
+        wi_scale_shape = (num_experts, 1, fused_out_dim)
+        wo_scale_shape = (self.num_experts, 1, self.moe_expert_input_dim)
       else:
         wi_scale_shape = (num_experts,)
         wo_scale_shape = (self.num_experts,)
@@ -1239,10 +1245,26 @@ class RoutedMoE(nnx.Module):
       # Phase 2: Resolve scale mesh sharding
       # - 3D block scale grids inherit full 3D kernel axes ("exp", "embed_moe", "mlp_moe")
       #   to partition synchronously with the weight tensors across expert and tensor meshes.
+      # - 3D per-channel scales (num_experts, 1, out_dim) leave the reduction axis unsharded.
       # - 1D per-expert scales (num_experts,) only span the expert axis, so sharding must
       #   use (self.wi_kernel_axes[0],) to prevent a rank mismatch with the 3D kernel axes.
-      wi_scale_sharding = self.wi_kernel_axes if block_size is not None else (self.wi_kernel_axes[0],)
-      wo_scale_sharding = self.wo_kernel_axes if block_size is not None else (self.wo_kernel_axes[0],)
+      if block_size is not None:
+        wi_scale_sharding = self.wi_kernel_axes
+        wo_scale_sharding = self.wo_kernel_axes
+      elif getattr(self.config, "fp8_moe", False):
+        wi_scale_sharding = (
+            self.wi_kernel_axes[0],
+            None,
+            self.wi_kernel_axes[2] if len(self.wi_kernel_axes) > 2 else self.wi_kernel_axes[-1],
+        )
+        wo_scale_sharding = (
+            self.wo_kernel_axes[0],
+            None,
+            self.wo_kernel_axes[2] if len(self.wo_kernel_axes) > 2 else self.wo_kernel_axes[-1],
+        )
+      else:
+        wi_scale_sharding = (self.wi_kernel_axes[0],)
+        wo_scale_sharding = (self.wo_kernel_axes[0],)
       self.wi_scale_axes = wi_scale_sharding
       self.wo_scale_axes = wo_scale_sharding
 
@@ -5218,7 +5240,9 @@ class RoutedMoE(nnx.Module):
         and cfg.use_gmm_v2
         and not is_fused_moe_path
     )
-    is_kernel_quantized = isinstance(self.quant, quantizations.ServeFp8WeightQuantization) and is_fused_moe_path
+    is_kernel_quantized = (
+        isinstance(self.quant, quantizations.ServeFp8WeightQuantization) or getattr(cfg, "fp8_moe", False)
+    ) and is_fused_moe_path
 
     def _maybe_native_gmm_weight(kernel, scale):
       """Non-fused (gmm_v2) path: a qpl.QArray wrapping kernel+scale when
@@ -5287,6 +5311,11 @@ class RoutedMoE(nnx.Module):
         else:
           wo_kernel = wo_kernel * jnp.asarray(self.per_expert_scale[...], self.dtype)[:, None, None]
 
+    if getattr(cfg, "fp8_moe_fake_quant", False) and not is_fused_moe_path:
+      w0_kernel = quantizations.fake_quantize_weight_per_channel(w0_kernel)
+      if w1_kernel is not None:
+        w1_kernel = quantizations.fake_quantize_weight_per_channel(w1_kernel)
+      wo_kernel = quantizations.fake_quantize_weight_per_channel(wo_kernel)
     if self.wi_0_sparsity_module is not None:
       _, w0_kernel = self.wi_0_sparsity_module(jnp.zeros_like(w0_kernel), w0_kernel)
       _, w1_kernel = self.wi_1_sparsity_module(jnp.zeros_like(w1_kernel), w1_kernel)

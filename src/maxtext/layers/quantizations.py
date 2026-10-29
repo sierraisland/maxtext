@@ -444,6 +444,41 @@ def prepare_fused_gmm_scale(scale: jnp.ndarray, kernel_shape: Tuple[int, ...]) -
   return jnp.expand_dims(scale, axis=2)  # (E, k_blocks, 1, n_dim)
 
 
+def quantize_weight_per_channel(
+    w: jnp.ndarray,
+    channel_axis: int = 2,
+    absmax: float | None = None,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+  """Quantizes a weight tensor to float8_e4m3fn with per-channel scaling."""
+  w_f32 = w.astype(jnp.float32)
+  reduce_axes = [i for i in range(w.ndim) if i != 0 and i != channel_axis]
+  if absmax is not None:
+    max_val = jnp.full(
+        [s if (i == 0 or i == channel_axis) else 1 for i, s in enumerate(w.shape)],
+        absmax,
+        dtype=jnp.float32,
+    )
+  else:
+    max_val = jnp.max(jnp.abs(w_f32), axis=reduce_axes, keepdims=True)
+  finfo = jnp.finfo(jnp.float8_e4m3fn)
+  max_fp8 = float(finfo.max)
+  scale = jnp.maximum(max_val / max_fp8, 1e-12).astype(jnp.float32)
+  q_w = jnp.clip(w_f32 / scale, -max_fp8, max_fp8).astype(jnp.float8_e4m3fn)
+  return q_w, scale
+
+
+def fake_quantize_weight_per_channel(
+    w: jnp.ndarray,
+    channel_axis: int = 2,
+    absmax: float | None = None,
+) -> jnp.ndarray:
+  """Fake-quantizes a weight tensor to the per-channel float8_e4m3fn grid with straight-through gradients."""
+  q, scale = jax.lax.stop_gradient(quantize_weight_per_channel(w, channel_axis=channel_axis, absmax=absmax))
+  q = jax.lax.optimization_barrier(q)
+  w_q = (q.astype(jnp.float32) * scale).astype(w.dtype)
+  return w_q + (w - jax.lax.stop_gradient(w))
+
+
 def _tiling_fn(lhs, rhs, dimension_numbers, tile_size):
   """apply tiling function"""
   del lhs, rhs
@@ -1090,7 +1125,11 @@ def get_quant_mode(quant_mode_str: str = "train"):
 
 def configure_quantization(config: Config, quant_mode_str: str = "train"):
   """Configure quantization based on user config and quant mode."""
-  if config.quantization == "serve_fp8_weight":
+  if config.quantization == "serve_fp8_weight" or (
+      config.quantization == "fp8_full"
+      and not config.use_qwix_quantization
+      and not getattr(config, "use_batch_split_schedule", False)
+  ):
     return ServeFp8WeightQuantization(act_calibration_method=config.act_quantization_calibration_method)
 
   if getattr(config, "use_batch_split_schedule", False) and config.quantization:

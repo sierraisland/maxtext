@@ -492,7 +492,8 @@ class MaxTextForCausalLM(nnx.Module):
         if num_requant > 0:
           max_logging.log(f"Requantized {num_requant} block-wise FP8 DenseGeneral layers to per-channel.")
       if (
-          getattr(self.maxtext_config, "prefuse_moe_weights", False)
+          isinstance(getattr(model, "quant", None), quantizations.ServeFp8WeightQuantization)
+          or getattr(self.maxtext_config, "fused_mlp", False)
           or os.environ.get("FUSE_SHARED_EXPERT_WI", "0") == "1"
       ) and os.environ.get("ENABLE_FULL_FP8_OPTIMIZATIONS", "1") == "1":
         num_fused = linears.fuse_model_mlp_wi(model)

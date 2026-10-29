@@ -949,7 +949,7 @@ class MlpBlockTest(unittest.TestCase):
     out_fp8_before = layer_fp8(inputs, deterministic=True)
     self.assertTrue(layer_fp8.fuse_wi_weights())
     self.assertEqual(layer_fp8.wi.kernel[...].shape, (in_features, 2, intermediate_dim))
-    self.assertEqual(layer_fp8.wi.kernel_scale[...].shape, (1, 2, 1))
+    self.assertEqual(layer_fp8.wi.kernel_scale[...].shape, (1, 2, intermediate_dim))
     out_fp8_after = layer_fp8(inputs, deterministic=True)
     np.testing.assert_allclose(
         np.asarray(out_fp8_before, dtype=np.float32),
