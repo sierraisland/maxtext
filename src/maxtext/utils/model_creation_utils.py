@@ -262,6 +262,8 @@ def _align_checkpoint_to_model_shapes(ckpt_arr, model_arr, logical_axes=None):
   ckpt_shape = ckpt_arr.shape
   model_shape = model_arr.shape
   if ckpt_shape == model_shape:
+    if getattr(ckpt_arr, "sharding", None) == model_arr.sharding:
+      return ckpt_arr
     return jax.device_put(ckpt_arr, model_arr.sharding)
   if len(ckpt_shape) != len(model_shape):
     raise ValueError(
@@ -356,6 +358,27 @@ def _fuse_moe_weights(ckpt_tree, model_arrays_tree, config=None, *, free_inputs:
       name = _key_str(key)
       if isinstance(node, dict) and name in node:
         node = node[name]
+      elif (
+          isinstance(node, dict)
+          and "local_layers" in node
+          and isinstance(name, str)
+          and name.startswith("layer_")
+          and name[6:].isdecimal()
+      ):
+        slot_idx = int(name[6:])
+        slot_axis = getattr(config, "param_scan_axis", 1) + 1 if config is not None else 2
+        local_leaves = [
+            x
+            for x in jax.tree_util.tree_leaves(node["local_layers"])
+            if hasattr(x, "shape") and x.ndim > slot_axis
+        ]
+        num_local = local_leaves[0].shape[slot_axis] if local_leaves else 0
+        if slot_idx < num_local:
+          node = node["local_layers"]
+        elif slot_idx == num_local and "global_layer" in node:
+          node = node["global_layer"]
+        else:
+          return None
       else:
         return None
     return node
@@ -380,39 +403,49 @@ def _fuse_moe_weights(ckpt_tree, model_arrays_tree, config=None, *, free_inputs:
 
     # Target size for a single half (wi_0 or wi_1) AFTER padding
     target_half_dim = wi_model.shape[-1] // 2
+    target_wi_shape = ckpt_node["wi_0"].shape[:-1] + (wi_model.shape[-1],)
 
-    # Helper to pad per-shard and reshape for interleaving
-    def _pad_and_chunk(arr, target_total_size):
-      shape = arr.shape
-      current_total_size = shape[-1]
+    # Fast path when no per-shard interleaving or padding is required
+    if (
+        n_shards == 1
+        and ckpt_node["wi_0"].shape[-1] == target_half_dim
+        and ckpt_node["wi_1"].shape[-1] == target_half_dim
+    ):
+      wi_fused = jnp.concatenate([ckpt_node["wi_0"], ckpt_node["wi_1"]], axis=-1)
+    else:
+      # Helper to pad per-shard and reshape for interleaving
+      def _pad_and_chunk(arr, target_total_size):
+        shape = arr.shape
+        current_total_size = shape[-1]
 
-      # Calculate per-shard chunk sizes
-      chunk_size = current_total_size // n_shards
-      target_chunk_size = target_total_size // n_shards
-      pad_amount = target_chunk_size - chunk_size
+        # Calculate per-shard chunk sizes
+        chunk_size = current_total_size // n_shards
+        target_chunk_size = target_total_size // n_shards
+        pad_amount = target_chunk_size - chunk_size
 
-      # Reshape to expose the per-shard chunk: (..., n_shards, chunk_size)
-      arr_reshaped = arr.reshape(*shape[:-1], n_shards, chunk_size)
+        # Reshape to expose the per-shard chunk: (..., n_shards, chunk_size)
+        arr_reshaped = arr.reshape(*shape[:-1], n_shards, chunk_size)
 
-      # Pad each chunk individually if necessary
-      if pad_amount > 0:
-        pad_widths = [(0, 0)] * arr_reshaped.ndim
-        pad_widths[-1] = (0, pad_amount)
-        arr_reshaped = jnp.pad(arr_reshaped, pad_widths)
+        # Pad each chunk individually if necessary
+        if pad_amount > 0:
+          pad_widths = [(0, 0)] * arr_reshaped.ndim
+          pad_widths[-1] = (0, pad_amount)
+          arr_reshaped = jnp.pad(arr_reshaped, pad_widths)
 
-      return arr_reshaped
+        return arr_reshaped
 
-    # Apply per-shard padding and chunking
-    padded_chunked_wi_0 = _pad_and_chunk(ckpt_node["wi_0"], target_half_dim)
-    padded_chunked_wi_1 = _pad_and_chunk(ckpt_node["wi_1"], target_half_dim)
+      # Apply per-shard padding and chunking
+      padded_chunked_wi_0 = _pad_and_chunk(ckpt_node["wi_0"], target_half_dim)
+      padded_chunked_wi_1 = _pad_and_chunk(ckpt_node["wi_1"], target_half_dim)
 
-    # Concatenate along the inner chunk dimension to interleave the shards
-    # Shape becomes: (..., n_shards, target_chunk_size * 2)
-    wi_interleaved = jnp.concatenate([padded_chunked_wi_0, padded_chunked_wi_1], axis=-1)
+      # Concatenate along the inner chunk dimension to interleave the shards
+      # Shape becomes: (..., n_shards, target_chunk_size * 2)
+      wi_interleaved = jnp.concatenate([padded_chunked_wi_0, padded_chunked_wi_1], axis=-1)
+      wi_fused = wi_interleaved.reshape(*target_wi_shape)
 
-    # Flatten the n_shards dimension back out to match the final model shape, drop wi_0/wi_1.
+    # Drop wi_0/wi_1 and optionally free their device buffers immediately.
     new_node = {k: v for k, v in ckpt_node.items() if k not in ("wi_0", "wi_1")}
-    new_node["wi"] = wi_interleaved.reshape(*wi_model.shape)
+    new_node["wi"] = wi_fused
     if free_inputs:
       for old_k in ("wi_0", "wi_1"):
         old_arr = ckpt_node.get(old_k)
@@ -1546,7 +1579,7 @@ def from_pretrained(
             checkpoint_out = checkpointing._deep_merge_dicts(checkpoint_out, col_tree)  # pylint: disable=protected-access
         return checkpoint_out
 
-      def _stack_legacy_cycle_layers(ckpt_node, model_node):
+      def _stack_legacy_cycle_layers(ckpt_node, model_node, *, free_inputs=False):
         if not isinstance(ckpt_node, dict) or not isinstance(model_node, dict):
           return ckpt_node
         if "local_layers" in model_node and "local_layers" not in ckpt_node and "layer_0" in ckpt_node:
@@ -1561,20 +1594,30 @@ def from_pretrained(
             if all(f"layer_{i}" in ckpt_node for i in range(num_local)):
               new_node = dict(ckpt_node)
               slot_trees = [new_node.pop(f"layer_{i}") for i in range(num_local)]
-              new_node["local_layers"] = jax.tree.map(lambda *xs: jnp.stack(xs, axis=slot_axis), *slot_trees)
+
+              def _stack_and_maybe_free(*xs):
+                stacked = jnp.stack(xs, axis=slot_axis)
+                if free_inputs:
+                  for x in xs:
+                    if isinstance(x, jax.Array) and not x.is_deleted():
+                      x.delete()
+                return stacked
+
+              new_node["local_layers"] = jax.tree.map(_stack_and_maybe_free, *slot_trees)
               if "global_layer" in model_node and f"layer_{num_local}" in new_node:
                 new_node["global_layer"] = new_node.pop(f"layer_{num_local}")
               ckpt_node = new_node
         return {
-            k: _stack_legacy_cycle_layers(v, model_node[k]) if k in model_node else v for k, v in ckpt_node.items()
+            k: _stack_legacy_cycle_layers(v, model_node[k], free_inputs=free_inputs) if k in model_node else v
+            for k, v in ckpt_node.items()
         }
 
       def _process_ckpt_tree(ckpt_dict, *, free_moe_inputs=False):
         if config.use_m3_model:
           ckpt_dict = m3_checkpoint.from_legacy_layer_names(ckpt_dict, sharded_state)
         ckpt_dict = to_dict(ckpt_dict)
-        ckpt_dict = _stack_legacy_cycle_layers(ckpt_dict, model_arrays)
         ckpt_dict = _fuse_moe_weights(ckpt_dict, model_arrays, config=config, free_inputs=free_moe_inputs)
+        ckpt_dict = _stack_legacy_cycle_layers(ckpt_dict, model_arrays, free_inputs=free_moe_inputs)
         ckpt_dict = _filter_to_model_keys(ckpt_dict, model_arrays)
         ckpt_dict = _walk_align(ckpt_dict, model_arrays, specs)
         if needs_fp8_moe_quant[0]:
@@ -1591,7 +1634,7 @@ def from_pretrained(
         checkpoint = _extract_checkpoint_tree(restored)
         del restored
         if checkpoint:
-          checkpoint = _process_ckpt_tree(checkpoint, free_moe_inputs=False)
+          checkpoint = _process_ckpt_tree(checkpoint, free_moe_inputs=True)
       else:
 
         def _build_restore_chunks(target_dict, rargs_dict, layer_chunk_size=5):
