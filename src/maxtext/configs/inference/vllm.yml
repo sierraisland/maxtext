@@ -90,6 +90,7 @@ logical_axis_rules: [
                       ['activation_embed', []],
                       # General Weights
                       ['mlp', ['attn_dp', 'model', 'expert', 'dcp']],
+                      ['num_activations', []],
                       ['embed', []],
                       ['embed_attn', []],
                       ['norm', []],
