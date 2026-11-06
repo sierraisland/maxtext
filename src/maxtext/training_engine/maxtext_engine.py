@@ -24,6 +24,7 @@ from collections.abc import Callable, Mapping
 import contextlib
 import dataclasses
 import functools
+import gc
 from typing import Any, Optional
 
 from absl import logging
@@ -40,6 +41,7 @@ from maxtext.integration.vllm.convert_utils import (
     resolve_prefuse_moe_weights,
     resolve_rollout_tp,
 )
+from maxtext.optimizers import optimizers as maxtext_optimizers
 from maxtext.trainers.pre_train import train as maxtext_train
 from maxtext.training_engine import abstract_engine
 from maxtext.training_engine import checkpointing
@@ -1149,8 +1151,13 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
       this micro-batch folded into the running totals.
     """
     loss_callable = self._loss_fn if self._loss_fn is not None else maxtext_train.loss_fn
+    trainable_patterns = getattr(self._config, "trainable_parameters_mask", None)
+    freeze_mask_fn = maxtext_optimizers._get_path_mask_fn(trainable_patterns, match_returns_true=False)
+    freeze_mask = freeze_mask_fn(params) if freeze_mask_fn is not None else None
 
     def diff_wrapper(p, r, b):
+      if freeze_mask is not None:
+        p = jax.tree.map(lambda x, frozen: jax.lax.stop_gradient(x) if frozen else x, p, freeze_mask)
       mdl = nnx.merge(self._model_graphdef, p, r, copy=True)
       if self._gen_model_input_fn is not None:
         # A gen_model_input_fn maps a payload to the loss fn's *keyword arguments* -- see
@@ -2229,6 +2236,7 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
 
       # 1. Drain all in-flight TPU computations to ensure weights are fully updated
       self._throttler.wait_for_all()
+      self._purge_raiden_buffers()
 
       # 2. Extract clean trainable parameters
       params_state = self._get_trainable_params_state()
@@ -2279,6 +2287,7 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
         logging.info("Source weights checksums: %s", self._raiden_sync.checksums())
 
       all_metadata = self._raiden_sync.work_unit_metadata_all()
+      self._purge_raiden_buffers()
       total_variables = sum(len(m.variables) for m in all_metadata)
 
       logging.info(
@@ -2297,6 +2306,16 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
     # naming the transport that was actually asked for.
     raise ValueError(f"unknown staging_transport {staging_transport!r}; expected 'raiden'.")
 
+  def _purge_raiden_buffers(self) -> int:
+    """Releases staged device-array references held on the Raiden synchronizer."""
+    if self._raiden_sync is None or not hasattr(self._raiden_sync, "release_buffers"):
+      return 0
+    released = self._raiden_sync.release_buffers()
+    if isinstance(released, int) and released > 0:
+      gc.collect()
+      return released
+    return 0
+
   def release_weight_sync(self, *, sync_request: Any = None) -> Any:
     """Releases staged weight buffers after transfer completion.
 
@@ -2308,6 +2327,7 @@ class MaxTextTrainingEngine(abstract_engine.AbstractTrainingEngine):
     self._staged_metadata = None
     if self._raiden_sync:
       logging.vlog(1, "Trainer Raiden metrics: %s", self._raiden_sync.metrics())
+      self._purge_raiden_buffers()
     return True
 
   def close(self) -> None:
